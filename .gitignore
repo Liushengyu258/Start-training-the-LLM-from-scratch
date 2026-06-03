@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pt
+*.bin
+*.pkl
+*.png
+out/
+data/input.txt
+.idea/
+.vscode/

@@ -48,6 +48,8 @@ WEIGHT_DECAY   = 0.0
 GRAD_CLIP      = 1.0
 BETA           = 0.1         # DPO 温度系数
 SEED           = 1337
+USE_AMP        = True
+AMP_DTYPE      = torch.bfloat16
 # ============================================================
 
 
@@ -130,10 +132,17 @@ def estimate_loss(policy, reference, splits, batch_size, device):
         accs   = torch.zeros(EVAL_ITERS)
         for k in range(EVAL_ITERS):
             cho_ids, cho_mask, rej_ids, rej_mask = get_batch(data, batch_size, device)
-            pi_c = sequence_logprob(policy,    cho_ids, cho_mask)
-            pi_r = sequence_logprob(policy,    rej_ids, rej_mask)
-            rf_c = sequence_logprob(reference, cho_ids, cho_mask)
-            rf_r = sequence_logprob(reference, rej_ids, rej_mask)
+            if USE_AMP:
+                with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE):
+                    pi_c = sequence_logprob(policy,    cho_ids, cho_mask)
+                    pi_r = sequence_logprob(policy,    rej_ids, rej_mask)
+                    rf_c = sequence_logprob(reference, cho_ids, cho_mask)
+                    rf_r = sequence_logprob(reference, rej_ids, rej_mask)
+            else:
+                pi_c = sequence_logprob(policy,    cho_ids, cho_mask)
+                pi_r = sequence_logprob(policy,    rej_ids, rej_mask)
+                rf_c = sequence_logprob(reference, cho_ids, cho_mask)
+                rf_r = sequence_logprob(reference, rej_ids, rej_mask)
             loss, stats = dpo_loss(pi_c, pi_r, rf_c, rf_r, BETA)
             losses[k]  = loss.item()
             margins[k] = stats["reward_margin"]
@@ -146,6 +155,11 @@ def estimate_loss(policy, reference, splits, batch_size, device):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     # 1) 数据
     if not (os.path.exists(CHO_IDS) and os.path.exists(META_PATH)):
@@ -197,12 +211,20 @@ def main():
 
         cho_ids, cho_mask, rej_ids, rej_mask = get_batch(train_data, BATCH_SIZE, device)
 
-        # ---- 4 次 forward ----
-        pi_c = sequence_logprob(policy, cho_ids, cho_mask)
-        pi_r = sequence_logprob(policy, rej_ids, rej_mask)
-        with torch.no_grad():
-            rf_c = sequence_logprob(reference, cho_ids, cho_mask)
-            rf_r = sequence_logprob(reference, rej_ids, rej_mask)
+        # ---- 4 次 forward（混合精度 BF16） ----
+        if USE_AMP:
+            with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE):
+                pi_c = sequence_logprob(policy, cho_ids, cho_mask)
+                pi_r = sequence_logprob(policy, rej_ids, rej_mask)
+                with torch.no_grad():
+                    rf_c = sequence_logprob(reference, cho_ids, cho_mask)
+                    rf_r = sequence_logprob(reference, rej_ids, rej_mask)
+        else:
+            pi_c = sequence_logprob(policy, cho_ids, cho_mask)
+            pi_r = sequence_logprob(policy, rej_ids, rej_mask)
+            with torch.no_grad():
+                rf_c = sequence_logprob(reference, cho_ids, cho_mask)
+                rf_r = sequence_logprob(reference, rej_ids, rej_mask)
 
         loss, _ = dpo_loss(pi_c, pi_r, rf_c, rf_r, BETA)
 

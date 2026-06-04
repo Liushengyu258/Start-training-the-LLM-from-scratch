@@ -29,8 +29,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 每一步要按顺序执行的脚本
 STEP_SCRIPTS = {
-    1: ["data.py", "train.py"],
-    2: ["data.py", "train.py"],
+#  1: ["data.py", "train.py"],
+#   2: ["data.py", "train.py"],
     3: ["data.py", "train.py"],
     4: ["data.py", "train.py"],
     5: ["data.py", "train.py"],

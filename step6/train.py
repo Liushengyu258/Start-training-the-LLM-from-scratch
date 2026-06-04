@@ -36,6 +36,8 @@ LR_DECAY_ITERS = MAX_ITERS
 WEIGHT_DECAY   = 0.0         # SFT 通常不用或调小，避免“拉回”预训练的 weight 分布
 GRAD_CLIP      = 1.0
 SEED           = 1337
+USE_AMP        = True
+AMP_DTYPE      = torch.bfloat16
 # ============================================================
 
 
@@ -69,11 +71,15 @@ def estimate_loss(model, splits, batch_size, device):
     model.eval()
     out = {}
     for name, (ids, mask) in splits.items():
-        losses = torch.zeros(EVAL_ITERS)
+        losses = torch.zeros(EVAL_ITERS, device=device)
         for k in range(EVAL_ITERS):
             x, y = get_batch(ids, mask, batch_size, device)
-            _, loss = model(x, y)
-            losses[k] = loss.item()
+            if USE_AMP:
+                with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE):
+                    _, loss = model(x, y)
+            else:
+                _, loss = model(x, y)
+            losses[k] = loss.detach()
         out[name] = losses.mean().item()
     model.train()
     return out
@@ -92,6 +98,11 @@ def get_lr(it):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     # 1) 准备数据
     if not (os.path.exists(IDS_BIN) and os.path.exists(META_PATH)):
@@ -155,7 +166,11 @@ def main():
             pg["lr"] = lr
 
         x, y = get_batch(train_ids, train_mask, BATCH_SIZE, device)
-        _, loss = model(x, y)
+        if USE_AMP:
+            with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE):
+                _, loss = model(x, y)
+        else:
+            _, loss = model(x, y)
         optim.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)

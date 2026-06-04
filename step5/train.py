@@ -33,7 +33,7 @@ BATCH_SIZE     = 32        # 4060Ti 8GB 在 12M + block=512 下够用
 BLOCK_SIZE     = 512       # RoPE 打开后上下文再加倍
 MAX_ITERS      = 10000     # 数据变多了，多训一倍
 EVAL_INTERVAL  = 250       # 每多少步做一次评估 + 存 ckpt
-EVAL_ITERS     = 50        # 评估 batch 数（略调低减评估耗时）
+EVAL_ITERS     = 20        # 从 50 降到 20，省评估时间
 LR             = 3e-4      # 峰值学习率
 MIN_LR         = 3e-5      # 退火到的最小学习率
 WARMUP_ITERS   = 100       # 前多少步线性升温到 LR
@@ -41,38 +41,43 @@ LR_DECAY_ITERS = MAX_ITERS # 余弦退火在多少步内完成
 WEIGHT_DECAY   = 0.1       # AdamW 的权重衰减
 GRAD_CLIP      = 1.0       # 梯度裁剪阈值（梯度 L2 范数上限）
 SEED           = 1337      # 随机种子，便于复现
+# ---- 速度优化开关 ----
+USE_AMP        = True      # 开混合精度（BF16 on Ada/Ampere）
+AMP_DTYPE      = torch.bfloat16   # 4060Ti 推荐 bf16；老卡可用 torch.float16+GradScaler
 # ============================================================
 
 
 def get_batch(data, block_size, batch_size, device):
     """
-    随机从长 token 序列里采 batch_size 条长 block_size 的子串：
-        x = data[i : i+block_size]          ← 输入
-        y = data[i+1 : i+1+block_size]      ← 输出（每个位置预测下一个）
-    这种“偏移 1 位”的对齐方式就是语言模型的标准做法。
+    向量化采样：用 numpy 一次组好整个 (B, T) 矩阵，避免 Python 循环。
     """
-    # 随机起点：保证 i + block_size + 1 不越界
-    ix = torch.randint(len(data) - block_size - 1, (batch_size,))
-    # 把每条样本组成张量 (B, T)；data 是 uint16，要转成 int64 给 nn.Embedding 用
-    x = torch.stack([torch.from_numpy(data[i:i + block_size].astype(np.int64))         for i in ix])
-    y = torch.stack([torch.from_numpy(data[i + 1:i + 1 + block_size].astype(np.int64)) for i in ix])
-    # non_blocking=True 可以让 CPU→GPU 拷贝异步进行（配合 pin_memory 时更明显）
+    n = len(data) - block_size - 1
+    ix = np.random.randint(0, n, size=batch_size)
+    rng = np.arange(block_size, dtype=np.int64)
+    x_np = data[ix[:, None] + rng].astype(np.int64, copy=False)
+    y_np = data[ix[:, None] + rng + 1].astype(np.int64, copy=False)
+    x = torch.from_numpy(x_np).pin_memory() if device == "cuda" else torch.from_numpy(x_np)
+    y = torch.from_numpy(y_np).pin_memory() if device == "cuda" else torch.from_numpy(y_np)
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 
-@torch.no_grad()                        # 评估不需要算梯度
+@torch.no_grad()
 def estimate_loss(model, splits, block_size, batch_size, device):
-    """在 train 和 val 两个集合上各采 EVAL_ITERS 个 batch，分别求平均 loss。"""
-    model.eval()                        # 切到推理模式（关掉 Dropout）
+    """在 train/val 上各采 EVAL_ITERS 个 batch；loss 在 GPU 上累加，最后一次同步。"""
+    model.eval()
     out = {}
     for name, data in splits.items():
-        losses = torch.zeros(EVAL_ITERS)
+        losses = torch.zeros(EVAL_ITERS, device=device)
         for k in range(EVAL_ITERS):
             x, y = get_batch(data, block_size, batch_size, device)
-            _, loss = model(x, y)
-            losses[k] = loss.item()
+            if USE_AMP:
+                with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE):
+                    _, loss = model(x, y)
+            else:
+                _, loss = model(x, y)
+            losses[k] = loss.detach()
         out[name] = losses.mean().item()
-    model.train()                       # 切回训练模式
+    model.train()
     return out
 
 
@@ -95,6 +100,12 @@ def get_lr(it):
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    # 让 FP32 matmul 走 TF32（Ampere/Ada 上免费 1.5~2x 加速）
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     # 1) 准备数据：第一次运行会自动下载
     if not (os.path.exists(TRAIN_BIN) and os.path.exists(META_PATH)):
@@ -149,12 +160,16 @@ def main():
         # —— 取一个 batch ——
         x, y = get_batch(train_data, BLOCK_SIZE, BATCH_SIZE, device)
 
-        # —— 前向 + 计算 loss ——
-        _, loss = model(x, y)
+        # —— 前向 + 计算 loss（混合精度 BF16） ——
+        if USE_AMP:
+            with torch.amp.autocast(device_type="cuda", dtype=AMP_DTYPE):
+                _, loss = model(x, y)
+        else:
+            _, loss = model(x, y)
 
         # —— 反向传播 ——
-        optim.zero_grad(set_to_none=True)   # 清掉上一步的梯度（更省内存的写法）
-        loss.backward()                      # 自动求导，把梯度填进每个参数的 .grad
+        optim.zero_grad(set_to_none=True)
+        loss.backward()
 
         # —— 梯度裁剪：防止个别 batch 梯度过大把权重打飞 ——
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)

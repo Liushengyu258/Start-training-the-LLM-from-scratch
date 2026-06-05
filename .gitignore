@@ -5,6 +5,6 @@ __pycache__/
 *.pkl
 *.png
 out/
-data/input.txt
+*.txt
 .idea/
 .vscode/

@@ -47,9 +47,16 @@
   - `benchmark.py` 对比朴素 vs 缓存的速度，校验数学等价
   - 详见 [`step8/README.md`](./step8/README.md)
 
+- [`step9/`](./step9/) —— **第九步：100M 级模型 + 大数据集 + Flash-Attention**
+  - 模型扩到 ~120M 参数（GPT-2 Small 级别）：n_embd=768, n_layer=12
+  - 数据扩到 ~500M tokens（TinyStories 全量 + WikiText-103）
+  - Flash-Attention（PyTorch SDPA，零额外安装）
+  - 梯度累积 + 断点续训 + tokens/sec 监控
+  - 详见 [`step9/README.md`](./step9/README.md)
+
 ## 后续计划（待完善）
 
-- **step9**：扩到 50M+ 大模型 / 中文支持 / Flash-Attention
+- **step10**：中文支持 / 多语言 tokenizer / DDP 多卡训练
 
 ## 一键按顺序训练
 

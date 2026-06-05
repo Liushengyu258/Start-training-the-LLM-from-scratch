@@ -37,6 +37,7 @@ STEP_SCRIPTS = {
     6: ["data.py", "train.py"],
     7: ["data.py", "train.py"],
     8: ["data.py", "train.py"],
+    9: ["data.py", "train.py"],
 }
 
 
